@@ -1,0 +1,616 @@
+---
+title: "US COVID-19 Outbreak and Progression"
+author: "Cynthia Wang"
+date: "2025-12-19"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  dpi     = 300
+)
+dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Introduction
+
+## Data Source
+
+- **COVID-19 data**: [The New York Times GitHub repository](https://github.com/nytimes/covid-19-data)
+- **Population data**: [U.S. Census Bureau](https://www.census.gov/data/tables/time-series/demo/popest/2020s-state-total.html) and [the International Database (IDB)](https://www.census.gov/data-tools/demo/idb/#/table?dashboard_page=country&COUNTRY_YR_ANIM=2025)
+
+## Dataset Overview
+
+The COVID-19 datasets record cumulative counts of coronavirus cases and deaths from state and local government and health departments spanning **January 21, 2020 to March 23, 2023**, originally released by the New York Times. Tracking began with the first reported coronavirus case in Washington State and covers nation-level, state-level, and county-level records.
+
+> **Limitation**: Due to shortage of testing, data may underrepresent true infection counts during the initial outbreak period.
+
+**The datasets used in this project:**
+
+| File | Description |
+|---|---|
+| `us.csv` | National cumulative cases & deaths |
+| `us-states.csv` | State-level cumulative cases & deaths |
+| `us-population.xlsx` | Population estimates for 51 states (U.S. Census Bureau) |
+| `islands-population.xlsx` | Population for 4 U.S. territories (IDB) |
+
+> *Note: The Census Bureau does not provide annual estimates for Guam, Virgin Islands, American Samoa, and Northern Mariana Islands — these are supplemented by the IDB dataset.*
+
+## Research Objectives
+
+This project reconstructs the comprehensive trajectory of the COVID-19 pandemic in the U.S. from January 2020 through March 2023. Specifically, the analysis aims to:
+
+1. Quantify the **aggregate public health burden** of COVID-19 in the U.S.
+2. Characterize the **temporal evolution** of the pandemic, identifying seasonal wave patterns.
+3. Evaluate **geographic heterogeneity** in pandemic impact across states.
+
+## Key Variables
+
+| Variable | Type | Description |
+|---|---|---|
+| `date` | Date | Date cases/deaths were announced (midnight Eastern Time) |
+| `cases` | Integer | Confirmed + probable cases based on lab testing & exposure criteria |
+| `deaths` | Integer | Confirmed + probable COVID-19-related deaths |
+| `state` | Character | U.S. state or territory |
+| `fips` | Character | Federal Information Processing Series code (2-digit state, 5-digit county) |
+
+---
+
+# Setup: Required Packages
+
+```{r packages}
+# Uncomment to install packages if needed:
+# install.packages(c("tidyverse", "magrittr", "readxl", "lubridate",
+#                    "stringr", "zoo", "patchwork", "usmap", "scales", "tidytext"))
+
+suppressPackageStartupMessages({
+  library(tidyverse)   # Data manipulation & visualization (tidyr, dplyr, ggplot2, etc.)
+  library(magrittr)    # Pipe operator
+  library(readxl)      # Read Excel files
+  library(lubridate)   # Date handling
+  library(stringr)     # String manipulation
+  library(zoo)         # Rolling mean calculation
+  library(patchwork)   # Combine plots side-by-side
+  library(usmap)       # U.S. map visualization with FIPS codes
+  library(scales)      # Number formatting
+  library(tidytext)    # Reorder bars within facets
+})
+```
+
+---
+
+# Data Preparation
+
+## Import Data
+
+```{r import-data}
+us_df         <- read.csv("data/raw/us.csv")
+states_df     <- read.csv("data/raw/us-states.csv")
+us_population <- read_excel(
+  "data/raw/us-population.xlsx",
+  range     = "A10:F62",
+  col_names = c("state", "2020 base", "2020", "2021", "2022", "2023")
+)
+islands_population <- data.frame(read_xlsx("data/raw/islands-population.xlsx"))
+```
+
+```{r preview-data, results='hide'}
+# Quick preview of each dataset
+head(us_df)
+head(states_df)
+head(us_population)
+head(islands_population)
+```
+
+## Clean & Transform
+
+### Check Data Quality
+
+```{r data-quality-check}
+# Structure check
+str(us_df)
+str(states_df)
+str(us_population)
+str(islands_population)
+
+# Missing value check
+list(
+  us_df              = colSums(is.na(us_df)),
+  states_df          = colSums(is.na(states_df)),
+  us_population      = colSums(is.na(us_population)),
+  islands_population = colSums(is.na(islands_population))
+)
+```
+
+### Wrangle Population Data
+
+```{r wrangle-population}
+# Tidy the main population data: wide → long, remove leading "." from state names
+us_population <- us_population %>%
+  na.omit() %>%
+  select(state, `2020`, `2021`, `2022`, `2023`) %>%
+  mutate(state = str_remove(state, "^\\.")) %>%
+  pivot_longer(cols = -state, names_to = "year", values_to = "population") %>%
+  mutate(year = as.numeric(year))
+
+# Tidy the islands population data
+islands_pop_tidy <- islands_population %>%
+  select(Name, Year, Population) %>%
+  rename(state = Name, year = Year, population = Population) %>%
+  mutate(population = parse_number(population))
+
+# Combine all states + islands into one population lookup table
+us_pop_combined <- bind_rows(us_population, islands_pop_tidy)
+```
+
+### Join Population into COVID Data
+
+```{r join-population}
+# Join state-level population
+states_df <- states_df %>%
+  mutate(year = year(date)) %>%
+  left_join(us_pop_combined, by = c("state", "year"))
+
+# Aggregate U.S.-level population by year and join
+us_pop_by_year <- us_pop_combined %>%
+  group_by(year) %>%
+  summarise(population = sum(population), .groups = "drop")
+
+us_df <- us_df %>%
+  mutate(year = year(date)) %>%
+  left_join(us_pop_by_year, by = "year")
+```
+
+```{r validate-population-join}
+# Check for states with missing population after join (indicates unmatched keys)
+missing_pop_states <- states_df %>%
+  filter(is.na(population)) %>%
+  distinct(state, year)
+
+if (nrow(missing_pop_states) == 0) {
+  message("Population join validation passed: no missing values.")
+} else {
+  warning("Missing population for the following state-year combinations:")
+  print(missing_pop_states)
+}
+```
+
+### Fix Column Types
+
+```{r fix-types}
+# Convert date columns: character → Date (ensures chronological sorting)
+us_df$date     <- as.Date(us_df$date)
+states_df$date <- as.Date(states_df$date)
+
+# Pad FIPS codes with leading zeros (e.g., 6037 → "06037")
+states_df <- states_df %>%
+  mutate(fips = str_pad(fips, width = 2, side = "left", pad = "0"))
+```
+
+```{r verify-types}
+# Verify final data types
+str(us_df)
+str(states_df)
+```
+
+## Tidy Data
+
+### Cumulative Cases & Deaths
+
+```{r tidy-cumulative-us}
+# US-level: long format with metrics column
+us_tidy <- us_df %>%
+  pivot_longer(cols = c(cases, deaths),
+               names_to  = "metrics",
+               values_to = "count")
+
+# US-level: per-capita metrics
+us_tidy_per_pop <- us_df %>%
+  mutate(
+    cases_per_10k = cases  / population * 10000,
+    deaths_per_1m = deaths / population * 1000000
+  ) %>%
+  pivot_longer(cols = c(cases_per_10k, deaths_per_1m),
+               names_to  = "metrics_per_pop",
+               values_to = "count_per_pop") %>%
+  select(-c(cases, deaths))
+```
+
+```{r tidy-cumulative-states}
+# State-level: long format with metrics column
+states_tidy <- states_df %>%
+  pivot_longer(cols = c(cases, deaths),
+               names_to  = "metrics",
+               values_to = "count")
+
+# State-level: per-capita metrics
+states_tidy_per_pop <- states_df %>%
+  mutate(
+    cases_per_10k = cases  / population * 10000,
+    deaths_per_1m = deaths / population * 1000000
+  ) %>%
+  pivot_longer(cols = c(cases_per_10k, deaths_per_1m),
+               names_to  = "metrics_per_pop",
+               values_to = "count_per_pop") %>%
+  select(-c(cases, deaths))
+```
+
+### Daily New Cases & Deaths
+
+```{r daily-new-us}
+# US-level: compute daily new cases/deaths via lag differencing
+# pmax(..., 0) clips negative values caused by retroactive data corrections
+us_df <- us_df %>%
+  arrange(date) %>%
+  mutate(
+    new_cases  = pmax(cases  - lag(cases,  default = 0), 0),
+    new_deaths = pmax(deaths - lag(deaths, default = 0), 0)
+  )
+
+us_daily_tidy <- us_df %>%
+  select(-c(cases, deaths)) %>%
+  pivot_longer(cols = c(new_cases, new_deaths),
+               names_to  = "metrics",
+               values_to = "count")
+```
+
+```{r daily-new-states}
+# State-level: group by state before lag differencing to avoid cross-state bleed
+# pmax(..., 0) clips negative values caused by retroactive data corrections
+states_df <- states_df %>%
+  group_by(state) %>%
+  arrange(date) %>%
+  mutate(
+    new_cases  = pmax(cases  - lag(cases,  default = 0), 0),
+    new_deaths = pmax(deaths - lag(deaths, default = 0), 0)
+  ) %>%
+  ungroup()
+
+states_daily_tidy <- states_df %>%
+  select(-c(cases, deaths)) %>%
+  pivot_longer(cols = c(new_cases, new_deaths),
+               names_to  = "metrics",
+               values_to = "count")
+```
+
+---
+
+# Exploratory Data Analysis
+
+## Define Shared Plot Theme
+
+```{r define-theme}
+my_theme <- theme(
+  plot.title  = element_text(face = "bold", size = 15, hjust = 0.5),
+  axis.title  = element_text(face = "bold", size = 13),
+  axis.text   = element_text(size = 10),
+  legend.text = element_text(size = 10),
+  legend.position = "bottom"
+)
+```
+
+## Overall U.S. Impact (Jan 2020 – Mar 2023)
+
+### Summary Statistics as of Mar 23, 2023
+
+```{r summary-stats}
+us_df %>%
+  filter(date == as.Date("2023-03-23")) %>%
+  select(date, cases, deaths, population) %>%
+  mutate(
+    cases_per_10k      = cases  / population * 10000,
+    deaths_per_10k     = deaths / population * 10000,
+    case_fatality_rate = deaths / cases
+  )
+```
+
+**Key findings:**
+
+- **Total cases**: ~103.9 million infected
+- **Total deaths**: ~1.1 million deaths
+- **Cases per 10k**: ~3,053 per 10,000 people
+- **Deaths per 10k**: ~33.4 per 10,000 people
+- **Case fatality rate**: ~1.1% of confirmed cases resulted in death
+
+### Top 10 States by Total Cumulative Impact
+
+```{r fig1-top10-states, fig.width=10, fig.height=5, fig.cap="Top 10 states by cumulative cases and deaths (Mar 23, 2023)."}
+states_tidy %>%
+  filter(date == "2023-03-23") %>%
+  group_by(metrics) %>%
+  slice_max(order_by = count, n = 10) %>%
+  ungroup() %>%
+  mutate(state = reorder_within(state, count, metrics)) %>%
+  ggplot(aes(x = state, y = count, fill = metrics)) +
+  geom_col() +
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(~metrics, scales = "free") +
+  scale_fill_manual(
+    name   = "Metrics",
+    values = c("cases" = "royalblue", "deaths" = "tomato"),
+    labels = c("cases" = "Cumulative Cases", "deaths" = "Cumulative Deaths")
+  ) +
+  labs(
+    title = "Total Cases and Deaths by State (March 23, 2023)",
+    x = "State", y = "Count"
+  ) +
+  theme_minimal() + my_theme
+
+ggsave("output/figures/fig1_top10_states_total.png", width = 10, height = 5, dpi = 300)
+```
+
+```{r fig2-maps-total, fig.width=14, fig.height=8, fig.cap="Geographic distribution of cumulative cases and deaths across U.S. states (Mar 23, 2023)."}
+cases_map <- plot_usmap(
+  data    = states_tidy %>% filter(date == as.Date("2023-03-23"), metrics == "cases"),
+  values  = "count",
+  regions = "states",
+  labels  = TRUE
+) +
+  scale_fill_continuous(name = "Cumulative Cases", low = "white", high = "royalblue",
+                        label = scales::comma) +
+  labs(title = "Cumulative Cases across the US (2023-03-23)") +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.text = element_text(size = 7), legend.position = "right")
+
+deaths_map <- plot_usmap(
+  data    = states_tidy %>% filter(date == as.Date("2023-03-23"), metrics == "deaths"),
+  values  = "count",
+  regions = "states",
+  labels  = TRUE
+) +
+  scale_fill_continuous(name = "Cumulative Deaths", low = "white", high = "tomato",
+                        label = scales::comma) +
+  labs(title = "Cumulative Deaths across the US (2023-03-23)") +
+  theme(plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+        legend.text = element_text(size = 7), legend.position = "right")
+
+fig2 <- cases_map | deaths_map
+fig2
+ggsave("output/figures/fig2_maps_cumulative_total.png", plot = fig2, width = 14, height = 8, dpi = 300)
+```
+
+> **Findings:** California, Texas, Florida, and New York had the highest total cases and deaths — likely driven by their large population bases.
+
+### Top 10 States by Per-Capita Impact
+
+```{r fig3-top10-percapita, fig.width=10, fig.height=5, fig.cap="Top 10 states by per-capita cumulative cases and deaths (Mar 23, 2023)."}
+states_tidy_per_pop %>%
+  filter(date == "2023-03-23") %>%
+  group_by(metrics_per_pop) %>%
+  slice_max(order_by = count_per_pop, n = 10) %>%
+  ungroup() %>%
+  mutate(state = reorder_within(state, count_per_pop, metrics_per_pop)) %>%
+  ggplot(aes(x = state, y = count_per_pop, fill = metrics_per_pop)) +
+  geom_col() +
+  coord_flip() +
+  scale_x_reordered() +
+  facet_wrap(~metrics_per_pop, scales = "free") +
+  scale_fill_manual(
+    name   = "Per-Capita Metrics",
+    values = c("cases_per_10k" = "royalblue", "deaths_per_1m" = "tomato"),
+    labels = c("cases_per_10k" = "Cases per 10k", "deaths_per_1m" = "Deaths per 1m")
+  ) +
+  labs(
+    title = "Per-Capita Cases and Deaths by State (March 23, 2023)",
+    x = "State", y = "Count"
+  ) +
+  theme_minimal() + my_theme
+
+ggsave("output/figures/fig3_top10_states_percapita.png", width = 10, height = 5, dpi = 300)
+```
+
+```{r fig4-maps-percapita, fig.width=14, fig.height=8, fig.cap="Geographic distribution of cumulative cases and deaths across U.S. states (Mar 23, 2023)."}
+cases_per_map <- plot_usmap(
+  data    = states_tidy_per_pop %>%
+              filter(date == as.Date("2023-03-23"), metrics_per_pop == "cases_per_10k"),
+  values  = "count_per_pop",
+  regions = "states",
+  labels  = TRUE
+) +
+  scale_fill_continuous(name = "Cases per 10k", low = "white", high = "royalblue",
+                        label = scales::comma) +
+  labs(title = "Cumulative Cases per 10k People (2023-03-23)") +
+  theme(plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+        legend.text = element_text(size = 7), legend.position = "right")
+
+deaths_per_map <- plot_usmap(
+  data    = states_tidy_per_pop %>%
+              filter(date == as.Date("2023-03-23"), metrics_per_pop == "deaths_per_1m"),
+  values  = "count_per_pop",
+  regions = "states",
+  labels  = TRUE
+) +
+  scale_fill_continuous(name = "Deaths per 1m", low = "white", high = "tomato",
+                        label = scales::comma) +
+  labs(title = "Cumulative Deaths per 1m People (2023-03-23)") +
+  theme(plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+        legend.text = element_text(size = 7), legend.position = "right")
+
+fig4 <- cases_per_map | deaths_per_map
+fig4
+ggsave("output/figures/fig4_maps_cumulative_percapita.png", plot = fig4, width = 14, height = 8, dpi = 300)
+```
+
+> **Findings:** Per-capita analysis reveals a different picture — **Alaska and Rhode Island** top cases (>4,000 per 10k), while **West Virginia, Mississippi, and Arizona** lead in deaths (>4,500 per 1M).
+
+---
+
+## Temporal Evolution & Seasonality
+
+### Cumulative Trend with Variant Milestones
+
+```{r fig5-cumulative-trend, fig.width=10, fig.height=5, fig.cap="Cumulative COVID-19 cases and deaths in the U.S. (Jan 2020 -- Mar 2023), with key milestones annotated."}
+# Key pandemic events for annotation
+events <- data.frame(
+  event_date = as.Date(c("2020-03-11", "2020-12-29", "2021-07-01", "2021-12-01")),
+  label      = c("WHO Declared Pandemic", "Alpha Variant", "Delta Variant", "Omicron Variant")
+)
+
+ggplot(us_tidy_per_pop) +
+  geom_line(aes(x = date, y = count_per_pop, color = metrics_per_pop,
+                linetype = metrics_per_pop), linewidth = 1) +
+  scale_color_manual(
+    name   = "Metrics",
+    values = c("cases_per_10k" = "royalblue", "deaths_per_1m" = "tomato"),
+    labels = c("cases_per_10k" = "Cases per 10k", "deaths_per_1m" = "Deaths per 1m")
+  ) +
+  scale_linetype_manual(
+    name   = "Metrics",
+    values = c("cases_per_10k" = "solid", "deaths_per_1m" = "dashed"),
+    labels = c("cases_per_10k" = "Cases per 10k", "deaths_per_1m" = "Deaths per 1m")
+  ) +
+  scale_y_continuous(
+    name     = "Cases per 10k",
+    n.breaks = 10,
+    labels   = scales::comma,
+    sec.axis = sec_axis(~., name = "Deaths per 1m", labels = scales::comma)
+  ) +
+  scale_x_date(name = "Date", date_labels = "%Y-%m", date_breaks = "2 months") +
+  geom_vline(data = events, aes(xintercept = event_date),
+             linetype = "dashed", color = "grey40") +
+  geom_text(data = events, aes(x = event_date, y = Inf, label = label),
+            angle = 90, vjust = 1.5, hjust = 1.1, size = 3, color = "grey30") +
+  labs(
+    title    = "COVID-19 Cumulative Cases and Deaths Per Capita in the US",
+    subtitle = "(Jan 2020 – Mar 2023)"
+  ) +
+  theme_minimal() + my_theme +
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.x   = element_text(angle = 45, hjust = 1))
+
+ggsave("output/figures/fig5_cumulative_trend_percapita.png", width = 10, height = 5, dpi = 300)
+```
+
+> **Findings:** Five distinct pandemic phases are visible: (1) initial outbreak, (2) winter surge 2020–21, (3) Delta wave summer 2021, (4) Omicron surge winter 2021–22, and (5) post-pandemic stabilization. The death curve notably lags cases and does not spike as sharply during Omicron, suggesting vaccination effects.
+
+### Monthly New Cases & Deaths
+
+```{r fig6-monthly-trends, fig.width=10, fig.height=6, fig.cap="Monthly totals of new COVID-19 cases and deaths in the U.S. (Jan 2020 -- Mar 2023)."}
+us_monthly <- us_daily_tidy %>%
+  mutate(month_start = floor_date(date, unit = "month")) %>%
+  group_by(month_start, metrics) %>%
+  summarise(monthly_total = sum(count, na.rm = TRUE), .groups = "drop")
+
+ggplot(us_monthly, aes(x = month_start, y = monthly_total, color = metrics)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1) +
+  scale_color_manual(
+    name   = "Metrics",
+    values = c("new_cases" = "royalblue", "new_deaths" = "tomato"),
+    labels = c("new_cases" = "New Cases", "new_deaths" = "New Deaths")
+  ) +
+  facet_wrap(~metrics, scales = "free_y", ncol = 1) +
+  scale_y_continuous(labels = scales::comma) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "2 months") +
+  labs(
+    title    = "Monthly New COVID-19 Cases and Deaths in the US",
+    subtitle = "(Jan 2020 – Mar 2023)",
+    x = "Month", y = "Monthly Count"
+  ) +
+  theme_minimal() + my_theme +
+  theme(plot.subtitle = element_text(hjust = 0.5),
+        axis.text.x   = element_text(angle = 45, hjust = 1))
+
+ggsave("output/figures/fig6_monthly_new_cases_deaths.png", width = 10, height = 6, dpi = 300)
+```
+
+> **Findings:** Largest death peak: Jan 2021 (first winter surge). Largest case peak: Jan 2022 (Omicron). The lowest values in both occur around Jul 2021, likely reflecting vaccination rollout and herd immunity effects.
+
+---
+
+## Geographic Distribution Analysis
+
+### Severely Impacted States
+
+```{r fig7-impacted-states, fig.width=6, fig.height=6, fig.cap="U.S. states most severely impacted by COVID-19, identified by both total and per-capita burden."}
+severely_impacted <- c("Alaska", "Rhode Island", "West Virginia", "Mississippi",
+                       "Arizona", "California", "Texas", "Florida", "New York")
+
+map_states <- data.frame(state = severely_impacted, group = "Severely Impacted")
+
+plot_usmap(data = map_states, values = "group", labels = TRUE) +
+  scale_fill_manual(
+    name   = "Category",
+    values = c("Severely Impacted" = "orange"),
+    labels = c("Severely Impacted", "Other States"),
+    na.value = "gray90"
+  ) +
+  labs(title = "Severely Impacted US States") +
+  theme(plot.title = element_text(face = "bold", size = 10, hjust = 0.5),
+        legend.text = element_text(size = 7), legend.position = "right")
+
+ggsave("output/figures/fig7_map_severely_impacted_states.png", width = 6, height = 6, dpi = 300)
+```
+
+### State-Level 30-Day Rolling Average
+
+```{r fig8-rolling-avg, fig.width=15, fig.height=20, fig.cap="30-day rolling average of daily new cases and deaths in the nine severely impacted states (Jan 2020 -- Mar 2023)."}
+states_daily_subset <- states_daily_tidy %>%
+  filter(state %in% severely_impacted) %>%
+  mutate(metrics = factor(metrics, levels = c("new_cases", "new_deaths"))) %>%
+  group_by(state, metrics) %>%
+  arrange(date) %>%
+  mutate(rolling_count = rollmean(count, k = 30, fill = NA, align = "right")) %>%
+  ungroup()
+
+fig8 <- states_daily_subset %>%
+  filter(!is.na(rolling_count)) %>%
+  ggplot(aes(x = date, y = rolling_count, color = metrics)) +
+  geom_line(linewidth = 1) +
+  scale_color_manual(
+    name   = "Metrics",
+    values = c("new_cases" = "royalblue", "new_deaths" = "tomato")
+  ) +
+  facet_wrap(state ~ metrics, scales = "free", ncol = 2) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "4 months") +
+  labs(
+    title = "30-Day Rolling Average of New Cases vs. New Deaths",
+    x = "Date", y = "30-Day Rolling Average"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title    = element_text(face = "bold", size = 15, hjust = 0.5),
+    strip.text    = element_text(face = "bold", size = 13),
+    axis.text.x   = element_text(size = 10, angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+fig8
+ggsave("output/figures/fig8_rolling_avg_impacted_states.png", plot = fig8, width = 15, height = 20, dpi = 300)
+```
+
+> **Key findings:**
+>
+> 1. **Omicron Spike (Jan 2022):** Cases spiked massively nationwide; deaths rose more modestly, especially in CA and NY — suggesting vaccine protection against severe outcomes.
+> 2. **Regional Seasonality:** Southern states (AZ, FL, MS, TX) show summer waves; northern states (NY, RI) peak in winter.
+> 3. **Decoupling Over Time:** Post-2022, case counts stay lower and deaths drop further — reflecting vaccination, immunity, and milder variants.
+> 4. **NY Early Anomaly:** New York shows high early deaths with low confirmed cases, likely due to limited testing in early 2020.
+
+---
+
+# Summary
+
+This project reconstructs the U.S. COVID-19 pandemic trajectory from **January 21, 2020 to March 23, 2023**, integrating multi-source data to evaluate public health burden, temporal evolution, and geographic heterogeneity.
+
+**Key findings:**
+
+- A total of **103.9 million cases** and **1.1 million deaths** were recorded nationally.
+- The pandemic progressed through **five distinct waves**, with the Omicron surge (Jan 2022) producing the highest case counts.
+- A clear **decoupling of cases and deaths** emerged during Omicron, likely driven by vaccination and natural immunity.
+- **Regional seasonality** was evident: southern states peaked in summer; northern states peaked in winter.
+- Per-capita analysis highlighted disproportionate impact in **smaller states** (Alaska, Rhode Island, West Virginia).
+
+**Limitations:**
+
+- Early testing shortages undercount infections, particularly in New York in early 2020.
+- External vaccination coverage data were not integrated — limiting causal inference about fatality rate decline.
+- Analysis ends in March 2023 and does not capture subsequent variant developments.
+
